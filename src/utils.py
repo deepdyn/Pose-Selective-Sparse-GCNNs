@@ -102,26 +102,38 @@ def calculate_gflops(model, input_shape, device):
     dummy_input = torch.randn(1, *input_shape).to(device)
     
     def sparse_r2conv_handler(m: SparseR2Conv, x: torch.Tensor, y: torch.Tensor):
+        # Get the hard 0/1 mask from the gate to determine the active ratio
         with torch.no_grad():
             hard_mask = (m.gate.get_mask() > 0.5).float()
-        
         active_ratio = torch.mean(hard_mask)
+        
+        # Get the underlying dense convolution layer
         dense_conv = m.conv
         
+        # Get the spatial dimensions of the output
         output_dims = y.shape[2:]
-                
+        
+        # Handle integer vs. tuple kernel_size
         kernel_dims = dense_conv.kernel_size
         if isinstance(kernel_dims, int):
-            kernel_dims = (kernel_dims, kernel_dims) # Convert int to tuple, e.g., 3 -> (3, 3)        
+            kernel_dims = (kernel_dims, kernel_dims)
 
-        in_channels = dense_conv.in_type.size
-        out_channels = dense_conv.out_type.size
-        group_size = m.gate.gsize
+        # Get the effective number of input and output channels for the underlying planar convolution
+        in_channels_eff = dense_conv.in_type.size
+        out_channels_eff = dense_conv.out_type.size
         
-        conv_per_position_flops = (2 * in_channels * group_size * kernel_dims[0] * kernel_dims[1])
-        active_flops = (conv_per_position_flops * output_dims[0] * output_dims[1] * out_channels)
+        # Calculate the FLOPs for the equivalent DENSE G-Convolution
+        # This is based on the standard formula for a 2D convolution, using the
+        # effective channel counts that e2cnn uses internally.
+        # FLOPs = 2 * (MACs) = 2 * (in_channels * out_channels * kernel_w * kernel_h * out_w * out_h)
+        dense_macs = in_channels_eff * out_channels_eff * kernel_dims[0] * kernel_dims[1] * output_dims[0] * output_dims[1]
+        dense_flops = 2 * dense_macs
         
-        m.total_ops += torch.DoubleTensor([int(active_flops * active_ratio)])
+        # Scale the total dense FLOPs by the ratio of active (non-pruned) output gates.
+        # This correctly reflects the theoretical computational savings at inference time.
+        pruned_flops = dense_flops * active_ratio
+        
+        m.total_ops += torch.DoubleTensor([pruned_flops])
 
     custom_ops = {
         SparseR2Conv: sparse_r2conv_handler,
