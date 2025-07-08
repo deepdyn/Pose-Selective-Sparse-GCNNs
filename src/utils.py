@@ -101,45 +101,34 @@ def calculate_gflops(model, input_shape, device):
 
     dummy_input = torch.randn(1, *input_shape).to(device)
     
-    # This is the custom rule for our sparse convolution layer
     def sparse_r2conv_handler(m: SparseR2Conv, x: torch.Tensor, y: torch.Tensor):
-        # Get the hard 0/1 mask from the gate
         with torch.no_grad():
             hard_mask = (m.gate.get_mask() > 0.5).float()
         
-        # Calculate the proportion of active (non-pruned) orientations
         active_ratio = torch.mean(hard_mask)
-        
-        # Get the underlying dense convolution layer
         dense_conv = m.conv
         
-        # Manually calculate the FLOPs for the dense convolution
-        # This is a standard formula for convolutions
         output_dims = y.shape[2:]
+                
         kernel_dims = dense_conv.kernel_size
+        if isinstance(kernel_dims, int):
+            kernel_dims = (kernel_dims, kernel_dims) # Convert int to tuple, e.g., 3 -> (3, 3)        
+
         in_channels = dense_conv.in_type.size
         out_channels = dense_conv.out_type.size
-        
-        # Operations per output element: (2 * in_channels * kernel_w * kernel_h)
-        # We account for the group dimension by multiplying with the size of the fiber group
         group_size = m.gate.gsize
         
         conv_per_position_flops = (2 * in_channels * group_size * kernel_dims[0] * kernel_dims[1])
-        
         active_flops = (conv_per_position_flops * output_dims[0] * output_dims[1] * out_channels)
         
-        # Scale the FLOPs by the ratio of active gates
         m.total_ops += torch.DoubleTensor([int(active_flops * active_ratio)])
 
-
-    # The custom_ops dictionary tells thop to use our new rule
     custom_ops = {
         SparseR2Conv: sparse_r2conv_handler,
     }
 
     try:
         model.eval()
-        # Profile the model using our custom handler
         total_ops, _ = profile(model, inputs=(dummy_input,), custom_ops=custom_ops, verbose=False)
         gflops = total_ops / 1e9
     except Exception as e:
